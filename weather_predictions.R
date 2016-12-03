@@ -6,12 +6,16 @@ lapply(c("caret",
          "dtplyr",
          "tidyverse",
          "pROC",
+         "TTR",
+         "data.table",
          "foreach",
          "doParallel"), library, character.only = T)
 
 ### ===================
 ### Define variables
 ### ===================
+
+rolling_period <- 7 # days
 
 # Set number of cores to use for parallel processing
 no_cores <- detectCores()
@@ -63,6 +67,9 @@ rm(data)
 ### Preprocess data
 ### ===================
 
+# Convert df to dataframe
+df <- as.data.frame(df)
+
 # Rename columns
 names(df)[names(df) == "DateUTC.br..."] <- "UTC_Date"
 
@@ -73,14 +80,27 @@ df$PrecipitationIn[df$PrecipitationIn == "N/A"] <- 0
 df$Wind.SpeedMPH[df$Wind.SpeedMPH == "Calm"] <- 0
 
 # Convert dates and times to correct format
-df$UTC_Date <- as.POSIXct(df$UTC_Date)
-df$UTC_Time <- format(df$UTC_Date, "%H:%M:%S")
+df$UTC_DateTime <- as.POSIXct(df$UTC_Date)
 df$UTC_Date <- as.Date(df$UTC_Date)
 
 # Correct other columns to appropriate formats
 df$Wind.SpeedMPH <- as.numeric(df$Wind.SpeedMPH)
 df$PrecipitationIn <- as.numeric(df$PrecipitationIn)
 
+### Get time elapsed between each reading
+  df$time_diff <- rbind(diff(as.matrix(df[,"UTC_DateTime"])), 0)
+  
+  # Reset last reading for each day to have time elapsed value
+  # to the end of the day
+  dt <- data.table(df[, c("UTC_Date", "Zip_Code", "UTC_DateTime")])
+  df$valRank <- dt[, valRank:=rank(UTC_DateTime), by = c("Zip_Code")]$valRank
+  df$diff_rank <- rbind(diff(as.matrix(df[, "valRank"])), 0)
+  df$time_diff[df$diff_rank != 1] <- 60 * (as.POSIXct(paste(df$UTC_Date[df$diff_rank != 1], "23:59:59 CDT")) - df$UTC_DateTime[df$diff_rank != 1])
+
+### START HERE!!!!!!!! ########
+### ALSO NEED TO WEIGHT THESE AGGREGATE MEASURES (AVERAGES) BASED ON TIME
+### RATHER THAN SIMPLE AVERAGES
+  
 # Drop unecessary columns
 keeps <- c("TemperatureF",
            "Dew.PointF",
@@ -90,8 +110,14 @@ keeps <- c("TemperatureF",
            "Conditions",
            "WindDirDegrees",
            "UTC_Date",
+           "UTC_DateTime",
            "Zip_Code")
-df <- subset(df, select = keeps)
+df <- df[, keeps]
+
+# Get aggregate measures for each day using time based weight averages
+#df$UTC_Time <- format(df$UTC_Date, "%H:%M:%S")
+#df$UTC_Date <- as.Date(df$UTC_Date)
+
 
 ### Aggregate data ###
 #
@@ -103,20 +129,39 @@ df <- subset(df, select = keeps)
 
 df_today <- 
   df %>%
-  filter(Zip_Code == zip_codes$my_zip, UTC_Date > dates[7]) %>%
+  filter(Zip_Code == zip_codes$my_zip, UTC_Date > dates[rolling_period]) %>%
   group_by(UTC_Date) %>%
   summarize(mean_temperature = mean(TemperatureF, na.rm = TRUE),
             total_precipitation = sum(PrecipitationIn, na.rm = TRUE))
 
 df_yesterday <-
   df %>%
-  filter(dates[6] < UTC_Date & UTC_Date < tail(dates, 1)) %>%
+  filter(dates[rolling_period - 1] < UTC_Date & UTC_Date < tail(dates, 1)) %>%
   group_by(Zip_Code, UTC_Date + 1) %>%
   summarize(mean_temperature = mean(TemperatureF, na.rm = TRUE))
 
-### NEED TO ADD WEEKLY MEASUREMENTS AND AGGREGATE MEASURES.  PROBABLY
-### ALSO NEED TO WEIGHT THESE AGGREGATE MEASURES (AVERAGES) BASED ON TIME
-### RATHER THAN SIMPLE AVERAGES
+# Define fields to perform rolling average on
+# (get it? rolling fields...)
+rolling_fields <- c("TemperatureF",
+                    "Dew.PointF",
+                    "Sea.Level.PressureIn",
+                    "Wind.SpeedMPH",
+                    "PrecipitationIn")
+
+# Get rolling averages for both zip codes
+for(z in zip_codes){
+  assign(paste("df_", z, sep = ""), df %>% filter(UTC_Date < tail(dates, 1), Zip_Code == z))
+
+  rolling_averages <- as.data.frame(apply(df_my_zip[, rolling_fields], 2, SMA, n = rolling_period))
+
+  # Rename columns
+  for(f in rolling_fields){
+    names(rolling_averages)[names(rolling_averages) == f] <- paste(f, "_rolling_", rolling_period, "_days", sep = "")
+  }
+
+  # Append rolling averages to dataframe
+  assign(paste("df_", z, sep = ""), cbind(df_my_zip, rolling_averages))
+}
 
 df_previous_week <- 
   df %>%
