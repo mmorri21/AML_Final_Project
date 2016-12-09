@@ -49,7 +49,7 @@ zip_codes <- list(my_zip = c(60502, "KDPA"), southwest_zip = c(61350, "KVYS"))  
 
 # Define types of models to be used
 regression_models <- c("glm", "svmLinear", "ranger")
-classification_models <- c("J48", "lssvmLinear")
+classification_models <- c("J48", "lssvmLinear", "knn")
 
 ### ====================
 ### Parallel Processing
@@ -348,7 +348,7 @@ names(df)[names(df) == precipitation_column] <- new_column                      
 
 df[, new_column] <- as.numeric(df[, new_column])
 df[is.na(df[, new_column]), new_column] <- 0                                                        # replace NA values
-df[, new_column] <- as.character(df[, new_column])                                                  # convert to character
+df[, new_column] <- as.factor(df[, new_column])                                                     # convert to factor
 
 # Add month in as an attribute                                                                      # use month as predictor
 df$month <- as.numeric(format(df$UTC_Date, "%m"))
@@ -403,11 +403,9 @@ for(t in target_variables){
   # Determine if regression problem or classification problem
   if(is.numeric(train_set$target)){
     models <- regression_models
-    output_type <- "raw"
     model_type <- "regression"
   } else{
     models <- classification_models
-    output_type <- "class"
     model_type <- "classification"
   }
   
@@ -418,17 +416,24 @@ for(t in target_variables){
     ### ===================
     ### Test Models
     ### ===================
-    prediction <- predict(model, newdata = test_set, type = output_type)
+    prediction <- predict(model, newdata = test_set, type = "raw")
     
     ### ===================
     ### Evaluate Models
     ### ===================
-    if(model_type == "regresion"){
+    if(model_type == "regression"){
       evaluation_metrics <- postResample(prediction, test_set$target)
-      results[m, "RMSE"] <- evaluation_metrics$RMSE
-      results[m, "Rsquared"] <- evaluation_metrics$Rsquared
+      results[m, "RMSE"] <- evaluation_metrics[[1]]
+      results[m, "Rsquared"] <- evaluation_metrics[[2]]
     } else{
-      roc_curve <- roc(test_set$target, prediction)
+      roc_curve <- roc(as.numeric(test_set$target), as.numeric(prediction)) ### WILL HAVE TO CHANGE FOR NON-NUMERIC TARGET (CONDITION)
+      confusion_matrix <- confusionMatrix(prediction, test_set$target)
+      results[m, "AUC"] <- roc_curve$auc
+      results[m, "Accuracy"] <- confusion_matrix$overall[[1]]
+      
+      # Print out confusion matrix
+      print(paste(m, "Confusion Matrix"))
+      print(confusion_matrix$table)
     }
   }
   
