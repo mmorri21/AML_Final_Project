@@ -8,10 +8,11 @@ lapply(c("caret",
          "tidyverse",
          "pROC",
          "ranger",
+         "kernlab",
          "e1071",
          "TTR",
-         "data.table",
          "foreach",
+         "zoo",
          "doParallel"), library, character.only = T)
 
 
@@ -20,14 +21,17 @@ lapply(c("caret",
 ### Define variables
 ### ===================
 
-rolling_period <- 7 # days
-target_variables <- c("TemperatureF", "PrecipitationIn", "Conditions")
-other_attributes <- c("Dew.PointF", "Sea.Level.PressureIn", "Wind.SpeedMPH", "Humidity")
-merge_columns <- c("UTC_Date", "Zip_Code")
+rolling_period <- 7 # days                                                                          # number of days prior to date of prediction
+                                                                                                    #   to calculate rolling averages for and
+                                                                                                    #   use as predictor
+target_variables <- c("TemperatureF", "PrecipitationIn", "Conditions")                              # values to predict
+other_attributes <- c("Dew.PointF", "Sea.Level.PressureIn", "Wind.SpeedMPH", "Humidity")            # variables to use as predictors
+merge_columns <- c("UTC_Date", "Zip_Code")                                                          # columns to be used in merging dataframes and grouping by
+precipitation_buckets <- 5                                                                          # number of buckets for precipitation output to create
 
 # Define fields to perform rolling average on
 # (get it? rolling fields...)
-rolling_fields <- c("TemperatureF",
+rolling_fields <- c("TemperatureF",                                                                 # metrics to calculate rolling averages on
                     "Dew.PointF",
                     "Sea.Level.PressureIn",
                     "Wind.SpeedMPH",
@@ -36,14 +40,16 @@ rolling_fields <- c("TemperatureF",
                     "Humidity")
 
 # List of dates to use for dataset
-dateRange <- list(min_date = as.Date('2010-10-31'), max_date = as.Date('2016-10-31'))
+dateRange <- list(min_date = as.Date('2010-10-31'), max_date = as.Date('2016-10-31'))               # range of dates to collect data for
 dates <- seq(dateRange$min_date, dateRange$max_date, "days")
 
 # Airport locations found on wunderground.com for zip code of interest.
 # On the website, go to historical data and see which airport is referenced.
-zip_codes <- list(my_zip = c(60502, "KDPA"), southwest_zip = c(61350, "KVYS"))
+zip_codes <- list(my_zip = c(60502, "KDPA"), southwest_zip = c(61350, "KVYS"))                      # zip codes to collect data for
 
-
+# Define types of models to be used
+regression_models <- c("glm", "svmLinear", "ranger")
+classification_models <- c("J48", "lssvmLinear")
 
 ### ====================
 ### Parallel Processing
@@ -64,7 +70,7 @@ registerDoParallel(no_cores)
 ### Get data
 ### ===================
 
-# Scrapes wunderground for data
+# Function that scrapes wunderground for data
 getData <- function(date, zip_code, airport){
   data <- read.csv(paste("https://www.wunderground.com/history/airport/", airport, "/",
                           format(date, "%Y"), "/", format(date, "%m"), "/", format(date, "%d"),
@@ -106,6 +112,9 @@ rm(data, dateRange) # cleanup
 
 # Convert df to dataframe
 df <- as.data.frame(df)
+
+# Drop duplicates
+df <- df[!duplicated(df), ]
 
 # Define unique conditions based on wunderground historical data
 conditions <- c("Unknown",
@@ -180,7 +189,7 @@ conditions_replace <- c("Unknown",
                         )
 
 df$Conditions <- mapvalues(df$Conditions, from = conditions, to = conditions_replace)               # convert conditions to higher level of aggregation
-condition_weights <- 0:(length(unique(conditions_replace)) - 1)                                     # define condition numeric variables
+condition_weights <- 1:(length(unique(conditions_replace))) - 1                                     # define condition numeric variables
 df$Conditions <- as.numeric(mapvalues(df$Conditions,                                                # codify conditions in dataframe
                                       from = unique(conditions_replace),
                                       to = condition_weights))
@@ -196,21 +205,17 @@ df[is.na(df)] <- 0                                                              
 df <- df[apply(df[rolling_fields], 1, function(row){all(abs(row) != 9999)}),]                       # remove outliers
 
 # Convert dates and times to correct format
-df$UTC_DateTime <- as.POSIXct(df$UTC_Date)                                                          # convert to POSIXct (timestamp)
+df$UTC_DateTime <- as.POSIXct(df$UTC_Date, format = "%Y-%m-%d %H:%M:%S")                            # convert to POSIXct (timestamp)
 df$UTC_Date <- as.Date(df$UTC_Date)                                                                 # convert to date
+
+# Clean up rows that have truncated/shifted data
+df$UTC_DateTime <- as.POSIXct(na.approx(df$UTC_DateTime), origin = "1970-01-01")                    # linearly inteprolate to fill in missing values
 
 # Get time elapsed between each reading
 df$time_diff <- rbind(diff(as.matrix(df$UTC_DateTime)), 0)
   
 # Reset time differences between zip codes by partitioning
-dt <- data.table(df[c(merge_columns, "UTC_DateTime")])                                              # create temporary data table
-df$valRank <- dt[valRank:=rank(UTC_DateTime), by = c("Zip_Code")]$valRank                           # create temporary ranking variable partitioned by zip code
-df$diff_rank <- rbind(diff(as.matrix(df$valRank)), 0)                                               # calculate difference in rankings
-df$time_diff[df$diff_rank != 1] <- 60 * (as.POSIXct(paste(df$UTC_Date[df$diff_rank != 1],           # keep only values with difference in ranking = 0
-                                                          "23:59:59 CDT"))                          #   > 0 means difference is across difference zip codes
-                                         - df$UTC_DateTime[df$diff_rank != 1])
-  
-rm(dt) # cleanup
+lapply(zip_codes, function(z) df$time_diff[tail(which(df$Zip_Code == z[1]), 1)] <<- 3600)
   
 # Drop unecessary columns
 keeps <- c("TemperatureF",
@@ -227,14 +232,13 @@ keeps <- c("TemperatureF",
 df <- df[keeps]                                                                                     # drop columns from dataframe
 
 # Multiply out measures to be aggregated
-df[paste(rolling_fields, "_weighted", sep = "")] <-
-  lapply(df[rolling_fields], function(x) x * df$time_diff)                                          # create time weighted average metrics
+df[rolling_fields] <- lapply(df[rolling_fields], function(x) x * df$time_diff)                      # create time weighted average metrics
 
 # Get aggregate measures for each day using time based weight averages
 df_agg <-
   df %>%
   group_by(UTC_Date, Zip_Code) %>%
-  summarise_at(.cols = vars(ends_with("weighted")), .funs = mean)                                   # aggregate average metrics by date and zip code
+  summarise_at(.cols = rolling_fields, .funs = mean)                                                # aggregate average metrics by date and zip code
 
 df_time <-
   df %>% 
@@ -247,18 +251,12 @@ rm(df_time)
 
 # Get weighted average aggregate measures
 df_agg[rolling_fields] <- lapply(df_agg[rolling_fields],
-                                 function(x) as.numeric(x / df_agg$total_time))                     #
-
-#for(r in rolling_fields){
-#  column_name <- paste(r, "_weighted", sep = "")                                                    # determine column name
-#  df_agg[, column_name] <- as.numeric(df_agg[, column_name] / df_agg[, "total_time"])               # divide multiplied out value by total time for that day
-#  names(df_agg)[names(df_agg) == column_name] <- r                                                  # rename new column to appropriate metric
-#}
+                                 function(x) as.numeric(x / df_agg$total_time))                     # calculate weighted average metrics on daily basis
 
 # Keep only necessary columns
-df_agg <- df_agg[, -which(names(df_agg) %in% c("total_time"))]
+df_agg <- df_agg[, -which(names(df_agg) %in% c("total_time"))]                                      # drop columns from dataframe
 
-rm(df, r, column_name) # cleanup
+rm(df) # cleanup
 
 ### Aggregate data ###
 #
@@ -270,7 +268,7 @@ rm(df, r, column_name) # cleanup
 
 # Function pivots fields out of dataframes with various date periods
 pivot <- function(data, column, period){
-  df_temp <- cast(data[c(merge_columns, column)], UTC_Date ~ Zip_Code, value = column)            # pivot fields out
+  df_temp <- cast(data[c(merge_columns, column)], UTC_Date ~ Zip_Code, value = column)              # pivot fields out
   columns <- mapply(c, zip_codes)[1, ]                                                              # get names of columns to rename
   names(df_temp)[names(df_temp) %in% columns] <- paste(columns, "_", column, "_", period, sep = "") # rename columns
   return(df_temp)
@@ -304,7 +302,7 @@ df_yesterday <- df_yesterday[, !duplicated(names(df_yesterday))]                
 previous_week <- function (data, zip_code){
   df_temp <- data %>% filter(UTC_Date < tail(dates, 1), Zip_Code == zip_code)                       # create temporary dataframe filtereted to appropriate dates
   df_temp <- as.data.frame(cbind(df_temp[merge_columns],
-                                 apply(df_temp[rolling_fields], 2, SMA, n = rolling_period)))     # create rolling averages of metrics
+                                 apply(df_temp[rolling_fields], 2, SMA, n = rolling_period)))       # create rolling averages of metrics
   
   return(df_temp)
 }
@@ -324,18 +322,35 @@ df_previous_week <- df_previous_week[, !duplicated(names(df_previous_week))]    
 
 
 # CREATE FINAL INPUT DATASET WITH ALL ATTRIBUTES
-df <- merge(df_today, df_yesterday, by = "UTC_Date")
+df <- merge(df_today, df_yesterday, by = "UTC_Date")                                                # merge datasets together
 df <- merge(df, df_previous_week, by = "UTC_Date")
 
 # Cleanup
 rm(df_agg, df_yesterday, df_today, df_previous_week)
 
 
-# Classify "Conditions" columns
+# Classify "Conditions" columns                                                                     # uncodify conditions
 condition_column <- paste(zip_codes$my_zip[1], "_Conditions_today", sep = "")
-df[condition_column] <- mapvalues(round(df[condition_column]), from = condition_weights, to = conditions)
+df[condition_column] <- mapvalues(round(df[, condition_column]),
+                                  from = condition_weights,
+                                  to = unique(conditions_replace))
 
-# Add month in as an attribute
+# Bucket precipitation outcomes                                                                     # bucket precipitation outcomes
+max_precip <- max(df[, paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")])
+buckets <- seq(0, max_precip, length.out = precipitation_buckets)
+reverse_squared <- (precipitation_buckets:1)^2
+lapply(1:precipitation_buckets, function(x) buckets[x] <<- buckets[x] / reverse_squared[x])
+
+precipitation_column <- paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")
+new_column <- paste(zip_codes$my_zip[1], "_precipitation_bucket", "_today", sep = "") 
+df[, precipitation_column] <- cut(df[, precipitation_column], breaks = buckets, labels = 1:4)
+names(df)[names(df) == precipitation_column] <- new_column                                          # rename precipitation bucket column
+
+df[, new_column] <- as.numeric(df[, new_column])
+df[is.na(df[, new_column]), new_column] <- 0                                                        # replace NA values
+df[, new_column] <- as.character(df[, new_column])                                                  # convert to character
+
+# Add month in as an attribute                                                                      # use month as predictor
 df$month <- as.numeric(format(df$UTC_Date, "%m"))
 
 ############# ====================================
@@ -350,14 +365,10 @@ df$month <- as.numeric(format(df$UTC_Date, "%m"))
 #
 # A list will be used to keep the results of each model
 
-# Define types of models to be used
-regression_models <- c("glm", "glm", "ranger")
-classification_models <- c("nnet")
-
 # Initialize list
-for(x in c("predictions", "evaluation_metrics")){
-  assign(x, list())
-}
+results <- data.frame()
+
+target_variables <- c("TemperatureF", "precipitation_bucket", "Conditions")                         # redefine based on new column names
 
 # Loop through each target variable
 for(t in target_variables){
@@ -375,7 +386,7 @@ for(t in target_variables){
   ### training & test sets
   ### =====================
   
-  train_index <- createDataPartition(y = df[target], p = 0.7, list = FALSE)                       # create index of training set
+  train_index <- createDataPartition(y = df[, target], p = 0.7, list = FALSE)                       # create index of training set
   
   train_set <- df[train_index, -exclude_columns]                                                    # create training set
   test_set <- df[-train_index, -exclude_columns]                                                    # create test set
@@ -413,7 +424,9 @@ for(t in target_variables){
     ### Evaluate Models
     ### ===================
     if(model_type == "regresion"){
-      
+      evaluation_metrics <- postResample(prediction, test_set$target)
+      results[m, "RMSE"] <- evaluation_metrics$RMSE
+      results[m, "Rsquared"] <- evaluation_metrics$Rsquared
     } else{
       roc_curve <- roc(test_set$target, prediction)
     }
