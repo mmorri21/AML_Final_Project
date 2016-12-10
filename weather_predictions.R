@@ -9,6 +9,7 @@ lapply(c("caret",
          "pROC",
          "ranger",
          "kernlab",
+         "klaR",
          "e1071",
          "TTR",
          "foreach",
@@ -27,7 +28,7 @@ rolling_period <- 7 # days                                                      
 target_variables <- c("TemperatureF", "PrecipitationIn", "Conditions")                              # values to predict
 other_attributes <- c("Dew.PointF", "Sea.Level.PressureIn", "Wind.SpeedMPH", "Humidity")            # variables to use as predictors
 merge_columns <- c("UTC_Date", "Zip_Code")                                                          # columns to be used in merging dataframes and grouping by
-precipitation_buckets <- 5                                                                          # number of buckets for precipitation output to create
+precipitation_buckets <- 2                                                                          # number of buckets for precipitation output to create
 
 # Define fields to perform rolling average on
 # (get it? rolling fields...)
@@ -49,7 +50,7 @@ zip_codes <- list(my_zip = c(60502, "KDPA"), southwest_zip = c(61350, "KVYS"))  
 
 # Define types of models to be used
 regression_models <- c("glm", "svmLinear", "ranger")
-classification_models <- c("J48", "lssvmLinear", "knn")
+classification_models <- c("rf", "nb", "knn")
 
 ### ====================
 ### Parallel Processing
@@ -189,7 +190,7 @@ conditions_replace <- c("Unknown",
                         )
 
 df$Conditions <- mapvalues(df$Conditions, from = conditions, to = conditions_replace)               # convert conditions to higher level of aggregation
-condition_weights <- 1:(length(unique(conditions_replace))) - 1                                     # define condition numeric variables
+condition_weights <- 1:(length(unique(conditions_replace)))                                         # define condition numeric variables
 df$Conditions <- as.numeric(mapvalues(df$Conditions,                                                # codify conditions in dataframe
                                       from = unique(conditions_replace),
                                       to = condition_weights))
@@ -335,23 +336,31 @@ df[condition_column] <- mapvalues(round(df[, condition_column]),
                                   from = condition_weights,
                                   to = unique(conditions_replace))
 
-# Bucket precipitation outcomes                                                                     # bucket precipitation outcomes
-max_precip <- max(df[, paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")])
-buckets <- seq(0, max_precip, length.out = precipitation_buckets)
-reverse_squared <- (precipitation_buckets:1)^2
-lapply(1:precipitation_buckets, function(x) buckets[x] <<- buckets[x] / reverse_squared[x])
+## Bucket precipitation outcomes                                                                     # bucket precipitation outcomes
+#max_precip <- max(df[, paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")])
+#buckets <- seq(0, max_precip, length.out = precipitation_buckets)
+#reverse_squared <- (precipitation_buckets:1)^2
+#lapply(1:precipitation_buckets, function(x) buckets[x] <<- buckets[x] / reverse_squared[x])
 
 precipitation_column <- paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")
-new_column <- paste(zip_codes$my_zip[1], "_precipitation_bucket", "_today", sep = "") 
-df[, precipitation_column] <- cut(df[, precipitation_column], breaks = buckets, labels = 1:4)
-names(df)[names(df) == precipitation_column] <- new_column                                          # rename precipitation bucket column
+#new_column <- paste(zip_codes$my_zip[1], "_precipitation_bucket", "_today", sep = "") 
+#df[, precipitation_column] <- cut(df[, precipitation_column], breaks = buckets,
+#                                  labels = 1:length(buckets) - 1)
+#names(df)[names(df) == precipitation_column] <- new_column                                          # rename precipitation bucket column
 
-df[, new_column] <- as.numeric(df[, new_column])
-df[is.na(df[, new_column]), new_column] <- 0                                                        # replace NA values
-df[, new_column] <- as.factor(df[, new_column])                                                     # convert to factor
+#df[, new_column] <- as.numeric(df[, new_column])
+#df[is.na(df[, new_column]), new_column] <- 0                                                        # replace NA values
+#df[, new_column] <- as.factor(df[, new_column])                                                     # convert to factor
+
+# Change precipitation to boolean
+df[df[, precipitation_column] > 0, precipitation_column] <- 1
+df[, precipitation_column] <- as.character(df[, precipitation_column])
 
 # Add month in as an attribute                                                                      # use month as predictor
 df$month <- as.numeric(format(df$UTC_Date, "%m"))
+
+# Drop rows with NA values.
+df <- df[apply(df, 1, function(row){all(!is.na(row))}),]
 
 ############# ====================================
 ############# BEGIN MODELING
@@ -426,10 +435,16 @@ for(t in target_variables){
       results[m, "RMSE"] <- evaluation_metrics[[1]]
       results[m, "Rsquared"] <- evaluation_metrics[[2]]
     } else{
-      roc_curve <- roc(as.numeric(test_set$target), as.numeric(prediction)) ### WILL HAVE TO CHANGE FOR NON-NUMERIC TARGET (CONDITION)
-      confusion_matrix <- confusionMatrix(prediction, test_set$target)
-      results[m, "AUC"] <- roc_curve$auc
+      confusion_matrix <- confusionMatrix(prediction, test_set$target)      
       results[m, "Accuracy"] <- confusion_matrix$overall[[1]]
+      
+      # Codify conditions if necessary
+      if(t == "Conditions"){
+        prediction <- mapvalues(prediction, from = unique(conditions_replace), to = condition_weights)
+        test_set$target <- mapvalues(test_set$target, from = unique(conditions_replace), to = condition_weights)
+      }
+      roc_curve <- roc(as.numeric(test_set$target), as.numeric(prediction))      
+      results[m, "AUC"] <- roc_curve$auc
       
       # Print out confusion matrix
       print(paste(m, "Confusion Matrix"))
