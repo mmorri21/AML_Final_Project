@@ -11,6 +11,7 @@ lapply(c("caret",
          "kernlab",
          "klaR",
          "e1071",
+         "randomForest",
          "TTR",
          "foreach",
          "zoo",
@@ -343,18 +344,18 @@ df[condition_column] <- mapvalues(round(df[, condition_column]),
 #lapply(1:precipitation_buckets, function(x) buckets[x] <<- buckets[x] / reverse_squared[x])
 
 precipitation_column <- paste(zip_codes$my_zip[1], "_PrecipitationIn_today", sep = "")
-#new_column <- paste(zip_codes$my_zip[1], "_precipitation_bucket", "_today", sep = "") 
+new_column <- paste(zip_codes$my_zip[1], "_precipitation_bucket", "_today", sep = "") 
 #df[, precipitation_column] <- cut(df[, precipitation_column], breaks = buckets,
 #                                  labels = 1:length(buckets) - 1)
-#names(df)[names(df) == precipitation_column] <- new_column                                          # rename precipitation bucket column
+names(df)[names(df) == precipitation_column] <- new_column                                          # rename precipitation bucket column
 
 #df[, new_column] <- as.numeric(df[, new_column])
 #df[is.na(df[, new_column]), new_column] <- 0                                                        # replace NA values
 #df[, new_column] <- as.factor(df[, new_column])                                                     # convert to factor
 
 # Change precipitation to boolean
-df[df[, precipitation_column] > 0, precipitation_column] <- 1
-df[, precipitation_column] <- as.character(df[, precipitation_column])
+df[df[, new_column] > 0, new_column] <- 1
+df[, new_column] <- as.character(df[, new_column])
 
 # Add month in as an attribute                                                                      # use month as predictor
 df$month <- as.numeric(format(df$UTC_Date, "%m"))
@@ -434,6 +435,7 @@ for(t in target_variables){
       evaluation_metrics <- postResample(prediction, test_set$target)
       results[m, "RMSE"] <- evaluation_metrics[[1]]
       results[m, "Rsquared"] <- evaluation_metrics[[2]]
+      results[m ,"MAD"] <- mad(prediction, test_set$target)
     } else{
       confusion_matrix <- confusionMatrix(prediction, test_set$target)      
       results[m, "Accuracy"] <- confusion_matrix$overall[[1]]
@@ -441,9 +443,11 @@ for(t in target_variables){
       # Codify conditions if necessary
       if(t == "Conditions"){
         prediction <- mapvalues(prediction, from = unique(conditions_replace), to = condition_weights)
-        test_set$target <- mapvalues(test_set$target, from = unique(conditions_replace), to = condition_weights)
+        test_target <- mapvalues(test_set$target, from = unique(conditions_replace), to = condition_weights)
+      } else{
+        test_target <- test_set$target
       }
-      roc_curve <- roc(as.numeric(test_set$target), as.numeric(prediction))      
+      roc_curve <- roc(as.numeric(test_target), as.numeric(prediction))      
       results[m, "AUC"] <- roc_curve$auc
       
       # Print out confusion matrix
